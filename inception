@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1090
+
+WORKING_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
+CONFIG_FILE="${WORKING_DIR}/inception.conf"
+WEBDAV_DIR="inception"
+
+# /////////////////////////////////////////////////////
+# PRINT FUNCTIONS
+# /////////////////////////////////////////////////////
+
+print_purple() { echo -e "\e[35m${1}\e[0m"; }
+print_red() { echo -e "\e[31m${1}\e[0m"; }
+print_green() { echo -e "\e[32m${1}\e[0m"; }
+print_yellow() { echo -e "\e[33m${1}\e[0m"; }
+
+# /////////////////////////////////////////////////////
+# PRINT HEADER
+# /////////////////////////////////////////////////////
+
+print_header() {
+    clear
+    echo ""
+    print_purple '██ ███    ██  ██████ ███████ ██████  ████████ ██  ██████  ███    ██ '
+    print_purple '██ ████   ██ ██      ██      ██   ██    ██    ██ ██    ██ ████   ██ '
+    print_purple '██ ██ ██  ██ ██      █████   ██████     ██    ██ ██    ██ ██ ██  ██ '
+    print_purple '██ ██  ██ ██ ██      ██      ██         ██    ██ ██    ██ ██  ██ ██ '
+    print_purple '██ ██   ████  ██████ ███████ ██         ██    ██  ██████  ██   ████ '
+    echo ""
+    print_yellow '                     WebDAV Server Exploit                          '
+    echo ""
+}
+
+# /////////////////////////////////////////////////////
+# CHECK ARGS
+# /////////////////////////////////////////////////////
+
+if [ "$1" = "" ]; then
+    print_header
+    echo "REMOTE"
+    echo -e "Start Server:\t$0 --server"
+    echo ""
+    echo "CLIENT"
+    echo -e "Exploit Script:\t$0 <script>"
+    echo -e "Lookup History:\t$0 --history"
+    echo -e "Clear WebDAV:\t$0 --clear"
+    exit 1
+fi
+
+# /////////////////////////////////////////////////////
+# LOGGING FUNCTION
+# /////////////////////////////////////////////////////
+
+log() {
+    local log_txt=''
+    [ -z "$2" ] && log_txt="$(print_green "INFO:") ${1}"
+    [ "$1" = "info" ] && [ -n "$2" ] && log_txt="$(print_green "INFO:") ${2}"
+    [ "$1" = "error" ] && [ -n "$2" ] && log_txt="$(print_red "ERRO:") ${2}"
+    [ "$1" = "warn" ] && [ -n "$2" ] && log_txt="$(print_yellow "WARN:") ${2}"
+    echo -e "$(date '+%Y-%m-%d %H:%M:%S') | ${log_txt}"
+}
+
+# /////////////////////////////////////////////////////
+# CREATE TEMP
+# /////////////////////////////////////////////////////
+
+TEMP_DIR="$(mktemp -d "$WORKING_DIR/tmp-inception.XXXXXXXXXX")"
+
+# /////////////////////////////////////////////////////
+# CONFIG
+# /////////////////////////////////////////////////////
+
+# Source config file
+source "$CONFIG_FILE"
+
+# Create config properties (if not exists)
+touch "$CONFIG_FILE" || exit 1
+[ -z "$WEBDAV_URL" ] && print_header && read -r -p "Enter WebDAV URL: " value </dev/tty && echo "WEBDAV_URL=\"${value}\"" >>"$CONFIG_FILE"
+[ -z "$WEBDAV_USER" ] && print_header && read -r -p "Enter WebDAV User: " value </dev/tty && echo "WEBDAV_USER=\"${value}\"" >>"$CONFIG_FILE"
+[ -z "$WEBDAV_PASS" ] && print_header && read -r -s -p "Enter WebDAV Password: " value </dev/tty && echo "WEBDAV_PASS=\"${value}\"" >>"$CONFIG_FILE"
+
+# Print header
+print_header
+
+# Source config file again
+source "$CONFIG_FILE" || exit 1
+
+# Check config
+[ -z "$WEBDAV_URL" ] && log "error" "WEBDAV_URL is missing" && exit 1
+[ -z "$WEBDAV_USER" ] && log "error" "WEBDAV_USER is missing" && exit 1
+[ -z "$WEBDAV_PASS" ] && log "error" "WEBDAV_PASS is missing" && exit 1
+
+# /////////////////////////////////////////////////////
+# LOCK / UNLOCK
+# /////////////////////////////////////////////////////
+
+try_lock() {
+
+    for ((retry = 0; retry < 50; retry++)); do
+
+        # Remove local tasks.lock
+        rm -f "${TEMP_DIR}/tasks.lock"
+
+        # Download tasks.lock
+        curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.lock" -o "${TEMP_DIR}/tasks.lock" -w '%{http_code}')
+        [ "$curl_result" = "000" ] && log "warn" "WebDAV not available (retry in 5s)" && sleep 5 && continue
+        [ "$curl_result" = "404" ] && touch "${TEMP_DIR}/tasks.lock"
+
+        # Check if locked by other host
+        [ "$(<"${TEMP_DIR}/tasks.lock")" != "" ] && [ "$(<"${TEMP_DIR}/tasks.lock")" != "$HOSTNAME" ] && log "warn" "tasks.lock locked by $(<"${TEMP_DIR}/tasks.lock") (retry in 5s)" && sleep 5 && continue
+
+        # Create WebDAV working dir (if not exists)
+        curl -Lfs -X MKCOL -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}" &>/dev/null
+
+        # Write hostname in local tasks.lock
+        ! echo -n "$HOSTNAME" >"${TEMP_DIR}/tasks.lock" && log "error" "Can not write to ${TEMP_DIR}/tasks.lock" && return 1
+
+        # Upload local tasks.lock to WebDAV
+        ! curl -Lfs -T "${TEMP_DIR}/tasks.lock" -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.lock" &>/dev/null && log "error" "Upload tasks.lock" && return 1
+
+        # Wait for sync
+        log "Try to lock tasks.lock..."
+        sleep 10
+
+        # Check new tasks.lock (read only)
+        ! curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.lock" -o "${TEMP_DIR}/tasks.lock" && log "error" "Download tasks.lock (check)" && return 1
+
+        # Check if not locked by this host
+        [ "$(<"${TEMP_DIR}/tasks.lock")" != "$HOSTNAME" ] && log "warn" "Check tasks.lock failed (locked by $(<"${TEMP_DIR}/tasks.lock")). Try again..." && sleep 5 && continue
+
+        # Success
+        log "tasks.lock sucessfully locked"
+        return 0
+
+    done
+
+    # Timeout
+    log "error" "Timout try to lock tasks.lock"
+    return 1
+}
+
+try_unlock() {
+
+    # Used by trap
+    local force="false" && [ "$1" = "force" ] && force="true"
+
+    for ((retry = 0; retry < 50; retry++)); do
+
+        # Remove local tasks.lock
+        rm -f "${TEMP_DIR}/tasks.lock"
+
+        # Download tasks.lock
+        curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.lock" -o "${TEMP_DIR}/tasks.lock" -w '%{http_code}')
+        [ "$curl_result" = "000" ] && [ "$force" = "true" ] && return 1 # NOTE: This can cause the issue, that tasks.lock keeps locked (when server is down)
+        [ "$curl_result" = "000" ] && log "warn" "WebDAV not available (retry in 5s)" && sleep 5 && continue
+        [ "$curl_result" = "404" ] && touch "${TEMP_DIR}/tasks.lock"
+
+        # Check if already unlocked
+        [ "$(<"${TEMP_DIR}/tasks.lock")" = "" ] && log "tasks.lock already unlocked" && return 0
+
+        # Check if locked by other host (critical)
+        [ "$(<"${TEMP_DIR}/tasks.lock")" != "$HOSTNAME" ] && log "error" "CRITICAL: tasks.lock locked by $(<"${TEMP_DIR}/tasks.lock")" && return 1
+
+        # Create WebDAV working dir (if not exists)
+        curl -Lfs -X MKCOL -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}" &>/dev/null
+
+        # Clear local tasks.lock
+        ! echo -n "" >"${TEMP_DIR}/tasks.lock" && log "error" "Can not write to ${TEMP_DIR}/tasks.lock" && return 1
+
+        # Upload local tasks.lock to WebDAV
+        ! curl -Lfs -T "${TEMP_DIR}/tasks.lock" -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.lock" &>/dev/null && log "error" "Upload tasks.lock" && return 1
+
+        # Success
+        log "tasks.lock sucessfully unlocked"
+        return 0
+
+    done
+
+    # Timeout
+    log "error" "Timout try to unlock tasks.lock"
+    return 1
+
+}
+
+# /////////////////////////////////////////////////////
+# CLEAR WEBDAV
+# /////////////////////////////////////////////////////
+
+clear_webdav_synced() {
+
+    # Try lock tasks.csv
+    try_lock || return 1
+
+    # Remove WebDAV dir
+    if ! curl -Lfs -X DELETE -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}" &>/dev/null; then
+        log "WebDAV can not be removed"
+        try_unlock
+        return 1
+    fi
+
+    # Log task created
+    log "WebDAV successfully cleared"
+
+    # Try unlock tasks.csv
+    try_unlock || return 1
+
+    # Success
+    return 0
+}
+
+# /////////////////////////////////////////////////////
+# CREATE TASK / REMOVE TASK
+# /////////////////////////////////////////////////////
+
+create_task_synced() {
+
+    local task_id="$1"
+    local task_sender="$2"
+    local task_script="$3"
+
+    # Try lock tasks.csv
+    try_lock || return 1
+
+    # Remove local tasks.csv
+    rm -f "${TEMP_DIR}/tasks.csv"
+
+    # Download tasks.csv from WebDAV
+    curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.csv" -o "${TEMP_DIR}/tasks.csv" -w '%{http_code}')
+    if [ "$curl_result" != "200" ] && [ "$curl_result" != "404" ]; then
+        log "error" "Download tasks.csv (${curl_result})"
+        try_unlock
+        return 1
+    fi
+
+    # Create WebDAV tasks dir (if not exists)
+    curl -Lfs -X MKCOL -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks" &>/dev/null
+
+    # Upload encoded script file to WebDAV tasks dir
+    ! base64 "${task_script}" >"${TEMP_DIR}/${task_id}.task" && log "error" "Base64 ${TEMP_DIR}/${task_id}.task" && return 1
+    if ! curl -Lfs -T "${TEMP_DIR}/${task_id}.task" -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.task" &>/dev/null; then
+        log "error" "Upload /tasks/${task_id}.task"
+        try_unlock
+        return 1
+    fi
+
+    # Add new task to local tasks.csv
+    if ! echo -e "${task_id};${task_sender};" >>"${TEMP_DIR}/tasks.csv"; then
+        log "error" "Add new task to ${TEMP_DIR}/tasks.csv"
+        try_unlock
+        return 1
+    fi
+
+    # Upload local tasks.csv to WebDAV
+    if ! curl -Lfs -T "${TEMP_DIR}/tasks.csv" -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.csv" &>/dev/null; then
+        log "error" "Upload tasks.csv"
+        try_unlock
+        return 1
+    fi
+
+    # Log task created
+    log "Task successfully created: ${task_id}"
+
+    # Try unlock tasks.csv
+    try_unlock || return 1
+
+    # Success
+    return 0
+}
+
+remove_csv_task_synced() {
+
+    local task_id="$1"
+
+    # Try lock tasks.csv
+    try_lock || return 1
+
+    # Remove local tasks.csv
+    rm -f "${TEMP_DIR}/tasks.csv"
+
+    # Download tasks.csv from WebDAV
+    curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.csv" -o "${TEMP_DIR}/tasks.csv" -w '%{http_code}')
+    if [ "$curl_result" != "200" ] && [ "$curl_result" != "404" ]; then
+        log "error" "Download tasks.csv (${curl_result})"
+        try_unlock
+        return 1
+    fi
+
+    # Remove task from local tasks.csv
+    sed -i "/^${task_id}.*/d" "${TEMP_DIR}/tasks.csv" || return 1
+
+    # Upload local tasks.csv to WebDAV
+    if ! curl -Lfs -T "${TEMP_DIR}/tasks.csv" -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.csv" &>/dev/null; then
+        log "error" "Upload tasks.csv"
+        try_unlock
+        return 1
+    fi
+
+    # Log task removed
+    log "CSV Task successfully removed: ${task_id}"
+
+    # Try unlock tasks.csv
+    try_unlock || return 1
+
+    # Success
+    return 0
+}
+
+remove_task_script() {
+
+    local task_id="$1"
+
+    # Remove task script from WebDAV
+    if ! curl -Lfs -X DELETE -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.task" &>/dev/null; then
+        log "error" "Remove ${task_id}.task"
+        try_unlock
+        return 1
+    fi
+
+    # Log task script removed
+    log "Task script successfully removed: ${task_id}"
+
+    # Success
+    return 0
+}
+
+remove_task_result() {
+
+    local task_id="$1"
+
+    # Remove task result from WebDAV
+    if ! curl -Lfs -X DELETE -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.result" &>/dev/null; then
+        log "error" "Remove ${task_id}.result"
+        try_unlock
+        return 1
+    fi
+
+    # Log result script removed
+    log "Task result successfully removed: ${task_id}"
+
+    # Success
+    return 0
+}
+
+# /////////////////////////////////////////////////////
+# LOOKUP CLIENT HISTORY
+# /////////////////////////////////////////////////////
+
+lookup_client_history() {
+
+    # Download tasks.csv from WebDAV
+    curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.csv" -o "${TEMP_DIR}/tasks.csv" -w '%{http_code}')
+
+    # Handle HTTP result
+    if [ "$curl_result" = "000" ]; then
+        log "error" "WebDAV not available"
+        return 1
+    fi
+    if [ "$curl_result" = "404" ]; then
+        log "warn" "tasks.csv not exists"
+        return 0
+    fi
+    if [ "$curl_result" != "200" ]; then
+        log "error" "HTTP Code '${curl_result}' not handled (refresh in 10s)"
+        return 1
+    fi
+
+    # Read in tasks.csv
+    while IFS=";" read -r task_id task_sender; do
+
+        # Check if task was sent from host
+        if [ "$task_sender" = "$HOSTNAME" ]; then
+
+            curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.result" -o "${TEMP_DIR}/${task_id}.result" -w '%{http_code}')
+
+            # If task result is not available yet
+            if [ "$curl_result" = "404" ]; then
+                log "warn" "Result not yet available for ${task_id}.task. Try again later..."
+                continue
+            fi
+
+            # If task result is available
+            if [ "$curl_result" = "200" ]; then
+
+                # Log
+                log "Result recieved..."
+
+                # Remove csv task & result
+                remove_csv_task_synced "$task_id" || return 1
+                remove_task_result "$task_id" || return 1
+
+                # Print task result
+                log "History result for ${task_id}:"
+                echo -e "--------------------------------------------------------------------"
+                base64 --decode "${TEMP_DIR}/${task_id}.result"
+                echo -e "--------------------------------------------------------------------"
+
+            fi
+        fi
+    done <"${TEMP_DIR}/tasks.csv"
+
+    # Finish
+    log "History lookup finished"
+
+}
+
+# /////////////////////////////////////////////////////
+# EXECUTE SCRIPT FROM CLIENT
+# /////////////////////////////////////////////////////
+
+exploit_script() {
+
+    local task_script="$1"
+    local task_id && task_id="$(base64 </dev/urandom | tr -dc A-Za-z1-9 | head -c 8)"
+    local task_sender="$HOSTNAME"
+
+    # Create new task
+    create_task_synced "$task_id" "$task_sender" "$task_script" || return 1
+
+    while true; do
+
+        # Try download task result from WebDAV
+        curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.result" -o "${TEMP_DIR}/${task_id}.result" -w '%{http_code}')
+
+        # If task result is not available yet
+        if [ "$curl_result" = "404" ]; then
+            log "Waiting for task result from server (refresh in 5s)" && sleep 5 && continue
+        fi
+
+        # If task result is available
+        if [ "$curl_result" = "200" ]; then
+
+            # Log
+            log "Result recieved..."
+
+            # Remove csv task & result
+            remove_csv_task_synced "$task_id" || return 1
+            remove_task_result "$task_id" || return 1
+
+            # Print task result
+            log "Result for ${task_id}:"
+            echo -e "--------------------------------------------------------------------"
+            base64 --decode "${TEMP_DIR}/${task_id}.result"
+            echo -e "--------------------------------------------------------------------"
+
+            # Finish
+            return 0
+        fi
+
+        # Failed
+        log "error" "HTTP Code not handled: ${curl_result}"
+        return 1
+
+    done
+}
+
+# /////////////////////////////////////////////////////
+# START SERVER DAEMON
+# /////////////////////////////////////////////////////
+
+start_server_daemon() {
+
+    while true; do
+
+        # Create local tasks dir
+        mkdir -p "${TEMP_DIR}/tasks/"
+
+        # Download tasks.csv from WebDAV
+        curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks.csv" -o "${TEMP_DIR}/tasks.csv" -w '%{http_code}')
+
+        # Handle HTTP result
+        if [ "$curl_result" = "000" ]; then
+            log "warn" "WebDAV not available (refresh in 10s)"
+            sleep 10
+            continue
+        fi
+        if [ "$curl_result" = "404" ]; then
+            log "warn" "tasks.csv not exists (refresh in 10s)"
+            sleep 10
+            continue
+        fi
+        if [ "$curl_result" != "200" ]; then
+            log "error" "HTTP Code '${curl_result}' not handled"
+            return 1
+        fi
+
+        # Read in tasks.csv
+        while IFS=";" read -r task_id task_sender; do
+
+            # Download encoded task script file
+            curl_result=$(curl -Lfs -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.task" -o "${TEMP_DIR}/tasks/${task_id}.task" -w '%{http_code}')
+
+            # Handle HTTP result
+            if [ "$curl_result" = "000" ]; then
+                log "warn" "WebDAV not available"
+                break
+            fi
+            if [ "$curl_result" = "404" ]; then
+                log "warn" "Task from '${task_sender}' already executed: ${task_id}"
+                continue
+            fi
+            if [ "$curl_result" != "200" ]; then
+                log "error" "HTTP Code '${curl_result}' not handled"
+                return 1
+            fi
+
+            # Decode task script and append wait
+            local script_decoded && script_decoded=$(printf '%s\n%s' "$(base64 --decode "${TEMP_DIR}/tasks/${task_id}.task")" 'wait') || return 1
+
+            # Execute decoded task script and write output
+            log "Executed task from '${task_sender}': ${task_id}.task"
+            bash -c "$script_decoded" &>"${TEMP_DIR}/tasks/${task_id}.output" || return 1
+
+            # Encode task result
+            echo -e "$(base64 "${TEMP_DIR}/tasks/${task_id}.output")" >"${TEMP_DIR}/tasks/${task_id}.result" || return 1
+
+            # Upload encoded task result to WebDAV
+            if ! curl -Lfs -T "${TEMP_DIR}/tasks/${task_id}.result" -u "${WEBDAV_USER}:${WEBDAV_PASS}" "${WEBDAV_URL}/${WEBDAV_DIR}/tasks/${task_id}.result" &>/dev/null; then
+                log "error" "Upload ${task_id}.result"
+                return 1
+            fi
+
+            # Remove task script
+            remove_task_script "$task_id" || return 1
+
+        done <"${TEMP_DIR}/tasks.csv"
+
+        # Idle
+        log "Waiting for new task (refresh in 10s)" && sleep 10 && continue
+
+    done
+}
+
+# /////////////////////////////////////////////////////
+# TRAP
+# /////////////////////////////////////////////////////
+
+# shellcheck disable=SC2317
+set_trap() {
+    echo "" && log "Cleanup..."
+    try_unlock "force" &>/dev/null || log "warn" "Cleanup failed"
+    rm -rf "$TEMP_DIR"
+    log "Exit"
+}
+
+# Set trap
+trap set_trap EXIT
+
+# /////////////////////////////////////////////////////
+# START
+# /////////////////////////////////////////////////////
+
+if [ "$1" = "--server" ]; then
+    log "Starting Server ($HOSTNAME)"
+    log "Temp dir: ${TEMP_DIR}"
+    start_server_daemon
+elif [ "$1" = "--clear" ]; then
+    log "Clear WebDAV "
+    log "Temp dir: ${TEMP_DIR}"
+    clear_webdav_synced
+elif [ "$1" = "--history" ]; then
+    log "Lookup History ($HOSTNAME)"
+    log "Temp dir: ${TEMP_DIR}"
+    lookup_client_history
+else
+    log "Exploit Script ($HOSTNAME)"
+    log "Temp dir: ${TEMP_DIR}"
+    script_file="$(cd "$(dirname "$1")" &>/dev/null && pwd)/$(basename "$1")"
+    [ ! -f "$script_file" ] && log "error" "Script '$script_file' not found" && exit 1
+    log "Script: ${script_file}"
+    exploit_script "$script_file"
+fi
