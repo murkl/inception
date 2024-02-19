@@ -1,6 +1,6 @@
 <h1 align="center">Inception</h1>
 
-<p align="center"><b>WebDAV Server Xploit</b></p>
+<p align="center"><b>WebDAV Server Xploiter</b></p>
 
 <div align="center">
   <p>
@@ -15,9 +15,6 @@
 # Usage
 
 ```
-# Download Inception (Client & Server)
-curl -Ls http//inception.webhop.me > inception
-
 # Start Server (Remote)
 ./inception --server
 
